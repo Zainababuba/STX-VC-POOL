@@ -15,6 +15,12 @@
 (define-constant ERR_ALREADY_VOTED (err u104))
 (define-constant ERR_VOTING_CLOSED (err u105))
 (define-constant ERR_BELOW_THRESHOLD (err u106))
+(define-constant ERR_INVALID_METADATA (err u107))
+(define-constant ERR_STAKE_NOT_FOUND (err u108))
+(define-constant ERR_ALREADY_STAKED (err u109))
+(define-constant ERR_MERGER_FAILED (err u110))
+(define-constant ERR_SAME_POOL (err u111))
+(define-constant ERR_UNSTAKING_LOCKED (err u112))
 
 ;; Data Maps
 (define-map pools
@@ -53,6 +59,40 @@
 ;; Pool counter
 (define-data-var pool-counter uint u0)
 (define-data-var proposal-counter uint u0)
+(define-data-var reward-rate uint u5000) ;; 0.005 STX per block per contribution unit
+
+;; FEATURE 1: Pool Metadata
+(define-map pool-metadata
+    { pool-id: uint }
+    {
+        name: (string-utf8 64),
+        description: (string-utf8 256),
+        category: (string-utf8 64),
+        logo-uri: (string-utf8 256)
+    }
+)
+
+;; FEATURE 2: Staking & Rewards
+(define-map staking-info
+    { pool-id: uint, staker: principal }
+    {
+        staked-amount: uint,
+        staked-at: uint,
+        last-reward-claim: uint
+    }
+)
+
+;; FEATURE 3: Pool Merging
+(define-map merger-proposals
+    { source-pool-id: uint, target-pool-id: uint }
+    {
+        proposed-by: principal,
+        votes-for: uint,
+        votes-against: uint,
+        created-at: uint,
+        status: (string-utf8 20)
+    }
+)
 
 ;; Read-only functions
 (define-read-only (get-pool (pool-id uint))
@@ -141,7 +181,7 @@
                 votes-for: u0,
                 votes-against: u0,
                 status: u"active",
-                created-at:stacks-block-height
+                created-at: stacks-block-height
             }
         )
         (var-set proposal-counter new-proposal-id)
@@ -218,4 +258,129 @@
             )
         )
     )
+)
 
+;; FEATURE 1: Pool Metadata Functions
+
+;; Set pool metadata
+(define-public (set-pool-metadata 
+    (pool-id uint)
+    (name (string-utf8 64))
+    (description (string-utf8 256))
+    (category (string-utf8 64))
+    (logo-uri (string-utf8 256)))
+
+    (let
+        ((pool (unwrap! (get-pool pool-id) ERR_POOL_NOT_FOUND)))
+
+        ;; Check if caller is the pool creator
+        (asserts! (is-eq tx-sender (get creator pool)) ERR_NOT_AUTHORIZED)
+        
+        ;; Validate inputs
+        (asserts! (> (len name) u0) ERR_INVALID_METADATA)
+        (asserts! (> (len description) u0) ERR_INVALID_METADATA)
+        
+        ;; Set metadata
+        (ok (map-set pool-metadata
+            { pool-id: pool-id }
+            {
+                name: name,
+                description: description,
+                category: category,
+                logo-uri: logo-uri
+            }
+        ))
+    )
+)
+
+;; Get pool metadata
+(define-read-only (get-pool-metadata (pool-id uint))
+    (map-get? pool-metadata { pool-id: pool-id })
+)
+
+;; Search pools by category
+(define-read-only (get-pools-by-category (category (string-utf8 64)) (limit uint))
+    (ok u"Implementation would require off-chain indexing")
+)
+
+;; FEATURE 2: Staking & Rewards System
+
+;; Set reward rate (only contract owner)
+(define-public (set-reward-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (ok (var-set reward-rate new-rate))
+    )
+)
+
+;; Stake contribution in a pool
+(define-public (stake-contribution (pool-id uint) (amount uint))
+    (let
+        ((pool (unwrap! (get-pool pool-id) ERR_POOL_NOT_FOUND))
+         (contribution (unwrap! (get-contribution pool-id tx-sender) ERR_NOT_AUTHORIZED))
+         (existing-stake (get-staking-info pool-id tx-sender)))
+        
+        ;; Checks
+        (asserts! (get active pool) ERR_POOL_NOT_FOUND)
+        (asserts! (<= amount (get amount contribution)) ERR_INSUFFICIENT_FUNDS)
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        
+        ;; If already staking, claim rewards first
+        (if (is-some existing-stake)
+            (try! (claim-staking-rewards pool-id))
+            true)
+        
+        ;; Set or update staking info
+        (ok (map-set staking-info
+            { pool-id: pool-id, staker: tx-sender }
+            {
+                staked-amount: (+ (default-to u0 (get staked-amount existing-stake)) amount),
+                staked-at: stacks-block-height,
+                last-reward-claim: stacks-block-height
+            }
+        ))
+    )
+)
+
+;; Get staking information
+(define-read-only (get-staking-info (pool-id uint) (staker principal))
+    (map-get? staking-info { pool-id: pool-id, staker: staker })
+)
+
+;; Calculate pending rewards
+(define-read-only (get-pending-rewards (pool-id uint))
+    (let
+        ((stake-data (unwrap! (get-staking-info pool-id tx-sender) ERR_STAKE_NOT_FOUND)))
+        
+        (let
+            ((blocks-staked (- stacks-block-height (get last-reward-claim stake-data)))
+             (staked-amount (get staked-amount stake-data))
+             (base-reward (* blocks-staked (var-get reward-rate))))
+            
+            (ok (* base-reward staked-amount))
+        )
+    )
+)
+
+(define-public (claim-staking-rewards (pool-id uint))
+    (let
+        ((stake-data (unwrap! (get-staking-info pool-id tx-sender) ERR_STAKE_NOT_FOUND)))
+
+        (let
+            ((blocks-staked (- stacks-block-height (get last-reward-claim stake-data)))
+             (staked-amount (get staked-amount stake-data))
+             (reward-amount (* (* blocks-staked (var-get reward-rate)) staked-amount)))
+
+            ;; Update last claim time
+            (map-set staking-info
+                { pool-id: pool-id, staker: tx-sender }
+                (merge stake-data { last-reward-claim: stacks-block-height })
+            )
+
+            ;; Transfer rewards if greater than zero
+            (if (> reward-amount u0)
+                (as-contract (stx-transfer? reward-amount tx-sender tx-sender))
+                (ok true))
+        )
+    )
+)
